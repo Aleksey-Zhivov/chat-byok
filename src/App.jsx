@@ -1,13 +1,17 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
+const LS_HISTORY_KEY = "chat_history_v1";
+const LS_MODEL_KEY = "chat_model_v1";
+
+// SSE decoder под /api/chat (проксирует /v1/responses)
 function decodeSSEChunk(text) {
   return text
     .split("\n\n")
     .filter(Boolean)
     .map((block) => {
-      const dataLine = block.split("\n").find((l) => l.startsWith("data: "));
-      if (!dataLine) return null;
-      const json = dataLine.slice(6);
+      const line = block.split("\n").find((l) => l.startsWith("data: "));
+      if (!line) return null;
+      const json = line.slice(6);
       if (json === "[DONE]") return { done: true };
       try {
         return { data: JSON.parse(json) };
@@ -19,47 +23,74 @@ function decodeSSEChunk(text) {
 }
 
 export default function App() {
-  const [apiKey, setApiKey] = useState(
-    localStorage.getItem("openai_api_key") || ""
-  );
-  const [remember, setRemember] = useState(true);
-  const [model, setModel] = useState("gpt-4o-mini");
-  const [messages, setMessages] = useState([]);
+  // История: [{role:'user'|'assistant', text:string}]
+  const [messages, setMessages] = useState(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem(LS_HISTORY_KEY));
+      return Array.isArray(saved) ? saved : [];
+    } catch {
+      return [];
+    }
+  });
+
+  const [model, setModel] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem(LS_MODEL_KEY)) || "gpt-4o-mini";
+    } catch {
+      return "gpt-4o-mini";
+    }
+  });
+
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const chatRef = useRef(null);
   const abortRef = useRef(null);
 
+  // автоскролл + сохранение истории
   useEffect(() => {
     chatRef.current?.scrollTo({ top: chatRef.current.scrollHeight });
+    localStorage.setItem(LS_HISTORY_KEY, JSON.stringify(messages));
   }, [messages]);
 
-  const push = (role, text) => setMessages((m) => [...m, { role, text }]);
+  useEffect(() => {
+    localStorage.setItem(LS_MODEL_KEY, JSON.stringify(model));
+  }, [model]);
+
+  const canSend = useMemo(
+    () => !loading && input.trim().length > 0,
+    [loading, input]
+  );
+
+  const push = (role, text) =>
+    setMessages((m) => [...m, { role, text: String(text ?? "") }]);
+
   const patchLastAssistant = (text) =>
     setMessages((m) => {
-      const last = [...m];
-      const idx = last.map((x) => x.role).lastIndexOf("assistant");
-      if (idx === -1) return [...m, { role: "assistant", text }];
-      last[idx] = { role: "assistant", text };
-      return last;
+      const arr = [...m];
+      const idx = arr.map((x) => x.role).lastIndexOf("assistant");
+      if (idx === -1) return [...arr, { role: "assistant", text }];
+      arr[idx] = { role: "assistant", text };
+      return arr;
     });
 
   async function send() {
-    if (!apiKey.trim()) {
-      alert("Введите OpenAI API key (sk-...)");
-      return;
-    }
-    if (!input.trim()) return;
+    if (!input.trim() || loading) return;
 
-    remember
-      ? localStorage.setItem("openai_api_key", apiKey.trim())
-      : localStorage.removeItem("openai_api_key");
-
+    // 1) добавляем сообщение пользователя в историю UI
     const userText = input.trim();
     setInput("");
     push("user", userText);
+    // placeholder для стриминга
     push("assistant", "");
     setLoading(true);
+
+    // 2) собираем историю для бэка (messages → format для Responses API)
+    // отправляем *всю* историю + последнее сообщение
+    const history = [
+      { role: "system", content: "You are a helpful assistant." },
+      ...messages.map((m) => ({ role: m.role, content: m.text })),
+      { role: "user", content: userText },
+    ];
 
     const controller = new AbortController();
     abortRef.current = controller;
@@ -70,18 +101,18 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           model,
-          input: [
-            { role: "system", content: "You are a helpful assistant." },
-            { role: "user", content: userText },
-          ],
+          // наш сервер поддерживает либо messages, либо input; здесь — messages
+          messages: history,
         }),
+        signal: controller.signal,
       });
 
       if (!resp.ok || !resp.body) {
-        const t = await resp.text().catch(() => "");
-        throw new Error(`HTTP ${resp.status}: ${t || resp.statusText}`);
+        const txt = await resp.text().catch(() => "");
+        throw new Error(`HTTP ${resp.status}: ${txt || resp.statusText}`);
       }
 
+      // 3) стримим
       const reader = resp.body.getReader();
       const decoder = new TextDecoder("utf-8");
       let buffer = "";
@@ -89,6 +120,7 @@ export default function App() {
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
+
         buffer += decoder.decode(value, { stream: true });
 
         const cut = buffer.lastIndexOf("\n\n");
@@ -100,9 +132,12 @@ export default function App() {
           for (const ev of events) {
             if (ev.done) continue;
             const d = ev.data;
+
+            // Responses API часто кладёт агрегированный текст в output_text
             if (d?.output_text) {
               patchLastAssistant(d.output_text);
             } else if (Array.isArray(d?.output)) {
+              // запасной путь — собрать из блоков
               const pieces = [];
               for (const item of d.output) {
                 if (Array.isArray(item?.content)) {
@@ -134,34 +169,24 @@ export default function App() {
     abortRef.current?.abort();
   }
 
+  function clearHistory() {
+    setMessages([]);
+    localStorage.removeItem(LS_HISTORY_KEY);
+  }
+
   return (
     <div className="container">
-      <h1>Chat (BYOK)</h1>
+      <h1>Chat</h1>
 
       <div className="card">
         <div className="row">
-          <div style={{ flex: "2 1 360px" }}>
-            <label>OpenAI API Key</label>
-            <input
-              type="password"
-              placeholder="sk-..."
-              value={apiKey}
-              onChange={(e) => setApiKey(e.target.value)}
-            />
-            <div style={{ marginTop: 6 }}>
-              <label>
-                <input
-                  type="checkbox"
-                  checked={remember}
-                  onChange={(e) => setRemember(e.target.checked)}
-                />{" "}
-                сохранять ключ в localStorage
-              </label>
-            </div>
-          </div>
           <div>
             <label>Модель</label>
-            <input value={model} onChange={(e) => setModel(e.target.value)} />
+            <input
+              value={model}
+              onChange={(e) => setModel(e.target.value)}
+              placeholder="gpt-4o-mini"
+            />
             <div className="muted">например: gpt-4o-mini</div>
           </div>
         </div>
@@ -175,30 +200,35 @@ export default function App() {
             </div>
           ))}
         </div>
+
         <div className="input-row">
           <textarea
             value={input}
             placeholder="Напишите сообщение и нажмите Отправить…"
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => {
-              if ((e.metaKey || e.ctrlKey) && e.key === "Enter") send();
+              if ((e.metaKey || e.ctrlKey) && e.key === "Enter" && canSend) {
+                send();
+              }
             }}
           />
         </div>
+
         <div className="buttons-row">
-          <button
-            className="primary"
-            onClick={send}
-            disabled={loading || !apiKey.trim() || !input.trim()}
-          >
+          <button className="primary" onClick={send} disabled={!canSend}>
             {loading ? "Генерация…" : "Отправить"}
           </button>
-          <button className="ghost" onClick={() => setMessages([])}>
+          <button className="ghost" onClick={clearHistory}>
             Очистить
           </button>
           <button className="ghost" onClick={stop} disabled={!loading}>
             Стоп
           </button>
+        </div>
+
+        <div className="muted" style={{ marginTop: 6 }}>
+          История хранится локально в браузере и отправляется на сервер как
+          контекст.
         </div>
       </div>
     </div>
