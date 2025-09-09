@@ -30,7 +30,17 @@ export default async function handler(req: any, res: any) {
       body: JSON.stringify(body),
     });
 
-    // Пробрасываем поток SSE
+    const ct = upstream.headers.get("content-type") || "";
+
+    // Если OpenAI вернул обычный JSON с ошибкой — пробросим как JSON
+    if (!ct.includes("text/event-stream")) {
+      const text = await upstream.text();
+      res.status(upstream.status);
+      res.setHeader("Content-Type", ct || "application/json; charset=utf-8");
+      return res.end(text);
+    }
+
+    // Иначе стримим SSE как есть
     res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
     res.setHeader("Cache-Control", "no-cache, no-transform");
     res.setHeader("Connection", "keep-alive");
@@ -49,6 +59,6 @@ export default async function handler(req: any, res: any) {
     }
     res.end();
   } catch (e: any) {
-    res.status(500).end(String(e?.message || e));
+    res.status(500).json({ error: { message: String(e?.message || e) } });
   }
 }

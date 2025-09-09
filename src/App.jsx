@@ -107,6 +107,26 @@ export default function App() {
         signal: controller.signal,
       });
 
+      // 1) Если сервер вернул JSON (ошибка), покажем её и выходим
+      if (!resp.ok) {
+        const txt = await resp.text().catch(() => "");
+        try {
+          const j = JSON.parse(txt);
+          const msg = j?.error?.message || txt || resp.statusText;
+          patchLastAssistant(""); // очистим плейсхолдер
+          push("system", `Ошибка API: ${msg}`);
+        } catch {
+          patchLastAssistant("");
+          push("system", `HTTP ${resp.status}: ${txt || resp.statusText}`);
+        }
+        return;
+      }
+      if (!resp.body) {
+        patchLastAssistant("");
+        push("system", `Пустой ответ от сервера.`);
+        return;
+      }
+
       if (!resp.ok || !resp.body) {
         const txt = await resp.text().catch(() => "");
         throw new Error(`HTTP ${resp.status}: ${txt || resp.statusText}`);
@@ -132,6 +152,18 @@ export default function App() {
           for (const ev of events) {
             if (ev.done) continue;
             const d = ev.data;
+
+            // 2) Событие ошибки внутри SSE
+            if (d?.type === "error" && d?.error) {
+              const msg =
+                d.error?.message ||
+                d.error?.code ||
+                d.error?.type ||
+                "Неизвестная ошибка";
+              patchLastAssistant("");
+              push("system", `Ошибка API: ${msg}`);
+              continue;
+            }
 
             // Responses API часто кладёт агрегированный текст в output_text
             if (d?.output_text) {
