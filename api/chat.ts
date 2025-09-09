@@ -1,52 +1,54 @@
-export const config = { runtime: "edge" };
-
-export default async function handler(req: Request) {
+export default async function handler(req: any, res: any) {
   if (req.method === "OPTIONS") {
-    return new Response(null, { headers: corsHeaders(req.headers.get("Origin")) });
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    return res.status(204).end();
   }
-  if (req.method !== "POST") {
-    return new Response("Method Not Allowed", { status: 405 });
+  if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
+
+  try {
+    const { model = "gpt-4o-mini", input, messages, system } = req.body || {};
+
+    const body = input
+      ? { model, input, stream: true }
+      : {
+          model,
+          input: [
+            ...(system ? [{ role: "system", content: system }] : []),
+            ...(Array.isArray(messages) ? messages : []),
+          ],
+          stream: true,
+        };
+
+    const upstream = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      },
+      body: JSON.stringify(body),
+    });
+
+    // Пробрасываем поток SSE
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+
+    if (!upstream.body) {
+      const txt = await upstream.text().catch(() => "");
+      return res.status(upstream.status).end(txt || upstream.statusText);
+    }
+
+    const reader = upstream.body.getReader();
+    const decoder = new TextDecoder();
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      res.write(decoder.decode(value));
+    }
+    res.end();
+  } catch (e: any) {
+    res.status(500).end(String(e?.message || e));
   }
-
-  const origin = req.headers.get("Origin") || "*";
-  const { model = "gpt-4o-mini", messages, input, system } = await req.json().catch(() => ({}));
-
-  // Поддерживаем формат Responses API
-  const body = input
-    ? { model, input, stream: true }
-    : {
-        model,
-        input: [
-          ...(system ? [{ role: "system", content: system }] : []),
-          ...(Array.isArray(messages) ? messages : []),
-        ],
-        stream: true,
-      };
-
-  const upstream = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${process.env.OPENAI_API_KEY!}`,
-    },
-    body: JSON.stringify(body),
-  });
-
-  return new Response(upstream.body, {
-    status: upstream.status,
-    headers: {
-      "Content-Type": "text/event-stream; charset=utf-8",
-      "Cache-Control": "no-cache, no-transform",
-      "Connection": "keep-alive",
-      ...corsHeaders(origin),
-    },
-  });
-}
-
-function corsHeaders(origin: string | null) {
-  return {
-    "Access-Control-Allow-Origin": origin || "*",
-    "Access-Control-Allow-Methods": "POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization",
-  };
 }
